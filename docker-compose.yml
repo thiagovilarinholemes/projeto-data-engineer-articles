@@ -1,0 +1,327 @@
+services:
+
+  # ==========================================================
+  # API
+  # ==========================================================
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    image: data-engineer-api:3.0
+    container_name: scientific-articles-api
+
+    restart: unless-stopped
+
+    environment:
+      TZ: America/Araguaina
+
+    env_file:
+    - ./.env
+
+    ports:
+      - "8000:8000"
+
+    volumes:
+      - ./api:/app
+
+    command:
+      [
+        "uvicorn",
+        "main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+        "--reload"
+      ]
+
+    networks:
+      - scientific-articles-network
+
+  # ==========================================================
+  # POSTGRES
+  # ==========================================================
+  postgres:
+    image: postgres:16
+    container_name: scientific-articles-postgres
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      TZ: America/Araguaina
+
+    env_file:
+    - ./.env
+
+    ports:
+      - "5434:5432"
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+    networks:
+      - scientific-articles-network
+
+  # ==========================================================
+  # PGADMIN 4 - INTERFACE GRÁFICA DO POSTGRESQL
+  # ==========================================================
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: scientific-articles-pgamdin
+
+    restart: unless-stopped
+
+    environment:
+      # E-mail utilizado para entrar no pgAdmin
+      PGADMIN_DEFAULT_EMAIL: thiago@gmail.com
+      # Defina uma senha própria para o pgAdmin
+      PGADMIN_DEFAULT_PASSWORD: 123
+      TZ: America/Araguaina
+
+    ports:
+      # Acessar pelo navegador em http://localhost:5050
+      - "5050:80"
+
+    depends_on:
+      - postgres
+
+    env_file:
+      - ./.env
+
+    networks:
+      - scientific-articles-network
+
+  # ========================================================== 
+  # LOCALSTACK - Simula serviços da AWS
+  # ==========================================================
+  localstack:
+    image: localstack/localstack:latest
+    container_name: scientific-articles-localstack
+
+    ports:
+      - "4566:4566"
+
+    env_file:
+      - ./.env
+
+    environment:
+      SERVICES: s3
+      DEBUG: 0
+      PERSISTENCE: 1
+      AWS_DEFAULT_REGION: us-east-1
+      TZ: America/Araguaina
+
+    volumes:
+      - localstack_data:/var/lib/localstack
+      - /var/run/docker.sock:/var/run/docker.sock
+
+    networks:
+      - scientific-articles-network
+
+  # ==========================================================
+  # S3 EXPLORER - INTERFACE GRÁFICA DO S3
+  # ==========================================================
+  s3-explorer:
+    build:
+      context: ./s3_explore
+      dockerfile: Dockerfile
+    # image: s3-explorer:1.0
+    container_name: scientific-articles-s3-explorer
+    ports:
+      - "8090:8003"
+    environment:
+      - S3_ENDPOINT_URL=http://localstack:4566
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_DEFAULT_REGION=us-east-1
+      - TZ=America/Araguaina
+      
+    depends_on:
+      - localstack
+
+    env_file:
+      - ./.env
+
+    volumes:
+      - localstack_data:/opt/airflow/app
+
+    networks:
+      - scientific-articles-network
+
+# ========================================================== 
+# AIRFLOW - ORQUESTRAÇÃO DE FLUXOS DE TRABALHO
+# ==========================================================
+  airflow-postgres:
+    image: postgres:16
+
+    container_name: scientific-articles-postgres-airflow
+
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: ${AIRFLOW_DB}
+      POSTGRES_USER: ${AIRFLOW_DB_USER}
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD}
+      TZ: America/Araguaina
+
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - /var/run/docker.sock:/var/run/docker.sock
+    
+    env_file:
+      - ./.env
+
+    networks:
+      - scientific-articles-network
+
+  # ==========================================================
+  # AIRFLOW INIT
+  # Inicialização do banco e criação do usuário administrador
+  # ==========================================================
+  airflow-init:
+    image: apache/airflow:2.10.5-python3.12
+
+    container_name: scientific-articles-airflow-init
+
+    depends_on:
+      airflow-postgres:
+        condition: service_started
+
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: >-
+        postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@airflow-postgres:5432/${AIRFLOW_DB}
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      TZ: America/Araguaina
+
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - /var/run/docker.sock:/var/run/docker.sock
+
+    env_file:
+      - ./.env
+
+    command:
+      - bash
+      - -c
+      - |
+        airflow db migrate &&
+        airflow users create \
+          --username ${AIRFLOW_ADMIN_USERNAME} \
+          --password ${AIRFLOW_ADMIN_PASSWORD} \
+          --firstname ${AIRFLOW_ADMIN_FIRSTNAME} \
+          --lastname ${AIRFLOW_ADMIN_LASTNAME} \
+          --role Admin \
+          --email ${AIRFLOW_ADMIN_EMAIL} || true
+
+    networks:
+      - scientific-articles-network
+
+  # ==========================================================
+  # AIRFLOW WEBSERVER
+  # Interface Web do Airflow
+  # ==========================================================
+  airflow-webserver:
+    image: apache/airflow:2.10.5-python3.12
+
+    container_name: scientific-articles-airflow-webserver
+
+    restart: unless-stopped
+
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: >-
+        postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@airflow-postgres:5432/${AIRFLOW_DB}
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__API__AUTH_BACKENDS: >-
+        airflow.api.auth.backend.session
+      TZ: America/Araguaina
+      environment:
+      PYTHONPATH: /opt/airflow
+
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./api/app:/opt/airflow/app
+
+    env_file:
+      - ./.env
+
+    ports:
+      - "8088:8080"
+
+    command:
+      - airflow
+      - webserver
+
+    networks:
+      - scientific-articles-network
+
+    # ==========================================================
+  # AIRFLOW SCHEDULER
+  # Executa e agenda as DAGs
+  # ==========================================================
+  airflow-scheduler:
+    image: apache/airflow:2.10.5-python3.12
+
+    container_name: scientific-articles-scheduler
+
+    restart: unless-stopped
+
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: >-
+        postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@airflow-postgres:5432/${AIRFLOW_DB}
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      TZ: America/Araguaina
+      environment:
+      PYTHONPATH: /opt/airflow
+
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./api/app:/opt/airflow/app
+
+    env_file:
+      - ./.env
+
+    command:
+      - airflow
+      - scheduler
+
+    networks:
+      - scientific-articles-network
+
+
+# ==========================================================
+# VOLUME
+# ==========================================================  
+volumes:
+  postgres_data:
+  localstack_data:
+  airflow_postgres_data:
+
+# ==========================================================
+# NETWORKS
+# ==========================================================   
+networks:
+  scientific-articles-network:
+    driver: bridge
